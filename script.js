@@ -3,6 +3,12 @@
 // ============================================================
 
 // ============================================================
+// RAILWAY BACKEND
+// ============================================================
+
+const API_BASE = "https://soundforge-production-b9a3.up.railway.app";
+
+// ============================================================
 // ORIGINAL 4 TRACKS
 // THESE MUST ALWAYS STAY SEPARATE FROM MY LIBRARY
 // ============================================================
@@ -13,7 +19,7 @@ const originalTracks = [
         title: "Generated Track 01",
         genre: "Classical",
         icon: "🎹",
-        file: "/audio/generated_music_1_loud.wav",
+        file: `${API_BASE}/audio/generated_music_1_loud.wav`,
         duration: "3:45"
     },
     {
@@ -21,7 +27,7 @@ const originalTracks = [
         title: "Generated Track 02",
         genre: "Classical",
         icon: "🎻",
-        file: "/audio/generated_music_2_loud.wav",
+        file: `${API_BASE}/audio/generated_music_2_loud.wav`,
         duration: "3:52"
     },
     {
@@ -29,7 +35,7 @@ const originalTracks = [
         title: "Generated Track 03",
         genre: "Classical",
         icon: "🎼",
-        file: "/audio/generated_music_3_loud.wav",
+        file: `${API_BASE}/audio/generated_music_3_loud.wav`,
         duration: "3:58"
     },
     {
@@ -37,7 +43,7 @@ const originalTracks = [
         title: "Generated Track 04",
         genre: "Classical",
         icon: "🎺",
-        file: "/audio/generated_music_4_loud.wav",
+        file: `${API_BASE}/audio/generated_music_4_loud.wav`,
         duration: "4:02"
     }
 ];
@@ -50,6 +56,31 @@ let generatedTracks = [];
 let currentTrack = null;
 let currentOriginalIndex = 0;
 let audioPlayer = null;
+
+// ============================================================
+// CONVERT BACKEND AUDIO PATH TO FULL URL
+// ============================================================
+
+function resolveAudioUrl(filePath) {
+    if (!filePath) {
+        return "";
+    }
+
+    const file = String(filePath).trim();
+
+    if (
+        file.startsWith("http://") ||
+        file.startsWith("https://")
+    ) {
+        return file;
+    }
+
+    if (file.startsWith("/")) {
+        return `${API_BASE}${file}`;
+    }
+
+    return `${API_BASE}/${file}`;
+}
 
 // ============================================================
 // GET AUDIO PLAYER SAFELY
@@ -126,14 +157,11 @@ function renderOriginalTracks() {
 
             <div class="track-details">
                 <h3>${escapeHTML(track.title)}</h3>
-
                 <p>${escapeHTML(track.genre)}</p>
-
                 <small>${escapeHTML(track.duration)}</small>
             </div>
 
             <div class="track-actions">
-
                 <button
                     type="button"
                     onclick="playOriginalTrack(${index})"
@@ -149,14 +177,16 @@ function renderOriginalTracks() {
                 >
                     🎧
                 </button>
-
             </div>
         `;
 
         grid.appendChild(card);
     });
 
-    console.log("Original 4 tracks rendered:", originalTracks.length);
+    console.log(
+        "Original 4 tracks rendered:",
+        originalTracks.length
+    );
 }
 
 // ============================================================
@@ -234,7 +264,6 @@ function renderLibrary() {
             </div>
 
             <div class="track-actions">
-
                 <button
                     type="button"
                     onclick="playGeneratedTrack(${index})"
@@ -250,7 +279,6 @@ function renderLibrary() {
                 >
                     🎧
                 </button>
-
             </div>
         `;
 
@@ -259,15 +287,18 @@ function renderLibrary() {
 }
 
 // ============================================================
-// LOAD SAVED LIBRARY FROM BACKEND
+// LOAD SAVED LIBRARY FROM RAILWAY BACKEND
 // ============================================================
 
 async function loadLibraryFromServer() {
     try {
-        const response = await fetch("/api/library", {
-            method: "GET",
-            cache: "no-store"
-        });
+        const response = await fetch(
+            `${API_BASE}/api/library`,
+            {
+                method: "GET",
+                cache: "no-store"
+            }
+        );
 
         if (!response.ok) {
             throw new Error(
@@ -282,7 +313,10 @@ async function loadLibraryFromServer() {
             data.success === true &&
             Array.isArray(data.tracks)
         ) {
-            generatedTracks = data.tracks;
+            generatedTracks = data.tracks.map(track => ({
+                ...track,
+                file: resolveAudioUrl(track.file)
+            }));
 
             renderLibrary();
 
@@ -299,7 +333,6 @@ async function loadLibraryFromServer() {
             generatedTracks = [];
             renderLibrary();
         }
-
     } catch (error) {
         console.error(
             "Library loading error:",
@@ -310,6 +343,7 @@ async function loadLibraryFromServer() {
         // Do NOT touch originalTracks here.
         // They are completely independent.
 
+        generatedTracks = generatedTracks || [];
         renderLibrary();
     }
 }
@@ -326,6 +360,7 @@ function playOriginalTrack(index) {
             "Original track not found:",
             index
         );
+
         return;
     }
 
@@ -335,6 +370,7 @@ function playOriginalTrack(index) {
         console.error(
             "audioPlayer element not found."
         );
+
         return;
     }
 
@@ -343,7 +379,8 @@ function playOriginalTrack(index) {
 
     player.pause();
 
-    player.src = track.file;
+    player.src = resolveAudioUrl(track.file);
+
     player.load();
 
     updatePlayerInformation(track);
@@ -383,6 +420,7 @@ function playGeneratedTrack(index) {
             "Generated track not found:",
             index
         );
+
         return;
     }
 
@@ -391,6 +429,7 @@ function playGeneratedTrack(index) {
             "Generated track has no audio file:",
             track
         );
+
         return;
     }
 
@@ -400,6 +439,7 @@ function playGeneratedTrack(index) {
         console.error(
             "audioPlayer element not found."
         );
+
         return;
     }
 
@@ -407,7 +447,8 @@ function playGeneratedTrack(index) {
 
     player.pause();
 
-    player.src = track.file;
+    player.src = resolveAudioUrl(track.file);
+
     player.load();
 
     updatePlayerInformation(track);
@@ -501,6 +542,7 @@ function togglePlay() {
             });
     } else {
         player.pause();
+
         updatePlayButtons(false);
     }
 }
@@ -570,6 +612,7 @@ function setupAudioEvents() {
         console.warn(
             "audioPlayer not found during initialization."
         );
+
         return;
     }
 
@@ -669,6 +712,7 @@ function updateDuration() {
 
     // Current HTML may not have durationValue.
     // That's okay.
+
     if (!slider || !value) {
         return;
     }
@@ -718,6 +762,7 @@ async function generateMusic() {
         console.error(
             "Required generation UI element is missing."
         );
+
         return;
     }
 
@@ -742,6 +787,7 @@ async function generateMusic() {
             "Please describe the music you want to create.";
 
         promptElement.focus();
+
         return;
     }
 
@@ -769,34 +815,43 @@ async function generateMusic() {
         `AI is creating your ${formatDuration(duration)} track. Please wait...`;
 
     try {
-
         // ====================================================
-        // SEND REQUEST
+        // SEND REQUEST TO RAILWAY BACKEND
         // ====================================================
 
         const response =
-            await fetch("/api/generate", {
-                method: "POST",
+            await fetch(
+                `${API_BASE}/api/generate`,
+                {
+                    method: "POST",
 
-                headers: {
-                    "Content-Type":
-                        "application/json"
-                },
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    },
 
-                body: JSON.stringify({
-                    prompt: prompt,
-                    genre: genre,
-                    duration: duration,
-                    creativity: creativity
-                })
-            });
+                    body: JSON.stringify({
+                        prompt: prompt,
+                        genre: genre,
+                        duration: duration,
+                        creativity: creativity
+                    })
+                }
+            );
+
+        let data;
+
+        try {
+            data = await response.json();
+        } catch (jsonError) {
+            throw new Error(
+                `Server returned an invalid response (${response.status}).`
+            );
+        }
 
         // ====================================================
         // READ RESPONSE
         // ====================================================
-
-        const data =
-            await response.json();
 
         if (
             !response.ok ||
@@ -847,7 +902,9 @@ async function generateMusic() {
                 prompt,
 
             file:
-                track.file,
+                resolveAudioUrl(
+                    track.file
+                ),
 
             duration:
                 track.duration ||
@@ -861,25 +918,29 @@ async function generateMusic() {
         // ====================================================
         // ADD ONLY TO MY LIBRARY
         // ORIGINAL 4 ARE NEVER TOUCHED
-        // ====================================================
+        // ========================================================
 
         generatedTracks.unshift(newTrack);
 
         renderLibrary();
 
-        // ====================================================
+        // ========================================================
         // PLAY NEW TRACK
-        // ====================================================
+        // ========================================================
 
-        const player = getAudioPlayer();
+        const player =
+            getAudioPlayer();
 
         if (player) {
-            currentTrack = newTrack;
+            currentTrack =
+                newTrack;
 
             player.pause();
 
             player.src =
-                newTrack.file;
+                resolveAudioUrl(
+                    newTrack.file
+                );
 
             player.load();
 
@@ -888,9 +949,9 @@ async function generateMusic() {
             );
         }
 
-        // ====================================================
+        // ========================================================
         // PREVIEW
-        // ====================================================
+        // ========================================================
 
         if (preview) {
             preview.className =
@@ -944,7 +1005,6 @@ async function generateMusic() {
         );
 
     } catch (error) {
-
         console.error(
             "Generation error:",
             error
@@ -955,7 +1015,6 @@ async function generateMusic() {
             "Unable to generate music.";
 
     } finally {
-
         button.disabled = false;
 
         buttonText.textContent =
@@ -1010,6 +1069,11 @@ document.addEventListener(
         );
 
         console.log(
+            "Railway backend:",
+            API_BASE
+        );
+
+        console.log(
             "Original tracks:",
             originalTracks.length
         );
@@ -1020,3 +1084,6 @@ document.addEventListener(
         );
     }
 );
+        
+
+        
