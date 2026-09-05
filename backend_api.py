@@ -7,15 +7,15 @@ import threading
 import traceback
 import json
 import os
-import time
 
 import numpy as np
 import scipy.io.wavfile
-import requests
+import torch
+from transformers import AutoProcessor, MusicgenForConditionalGeneration
 
 
 # ============================================================
-# SOUNDFORGE
+# SOUNDFORGE - LOCAL MUSICGEN
 # ============================================================
 
 app = Flask(__name__)
@@ -38,27 +38,7 @@ LIBRARY_FILE = BASE_DIR / "library.json"
 
 
 # ============================================================
-# REPLICATE
-# ============================================================
-
-REPLICATE_API_TOKEN = os.environ.get(
-    "REPLICATE_API_TOKEN",
-    ""
-).strip()
-
-REPLICATE_API_URL = (
-    "https://api.replicate.com/v1/predictions"
-)
-
-# Current public meta/musicgen version listed by Replicate.
-REPLICATE_MODEL_VERSION = (
-    "671ac645ce5e552cc63a54a2bbff63fcf798043055d2dac5fc9e36a837eedcfb"
-)
-
-
-# ============================================================
 # ORIGINAL 4 TRACKS
-# ALWAYS SEPARATE FROM MY LIBRARY
 # ============================================================
 
 ORIGINAL_TRACKS = [
@@ -102,10 +82,44 @@ ORIGINAL_TRACKS = [
 # ============================================================
 
 generation_jobs = {}
-
 generation_jobs_lock = threading.Lock()
+model_lock = threading.Lock()
 
-generation_lock = threading.Lock()
+
+# ============================================================
+# MUSICGEN MODEL
+# ============================================================
+
+MODEL_NAME = "facebook/musicgen-small"
+processor = None
+model = None
+
+
+def load_musicgen():
+    global processor, model
+
+    if processor is not None and model is not None:
+        return
+
+    print()
+    print("=" * 70)
+    print("SOUNDFORGE - LOADING MUSICGEN")
+    print("=" * 70)
+    print("Model:", MODEL_NAME)
+    print("First model load can take some time.")
+    print("=" * 70)
+
+    processor = AutoProcessor.from_pretrained(MODEL_NAME)
+    model = MusicgenForConditionalGeneration.from_pretrained(MODEL_NAME)
+
+    # Use CPU
+    model.to("cpu")
+    model.eval()
+
+    print("=" * 70)
+    print("MUSICGEN LOADED SUCCESSFULLY")
+    print("=" * 70)
+    print()
 
 
 # ============================================================
@@ -117,11 +131,7 @@ def load_library():
         return []
 
     try:
-        with open(
-            LIBRARY_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
+        with open(LIBRARY_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
 
         if isinstance(data, list):
@@ -135,17 +145,8 @@ def load_library():
 
 def save_library(tracks):
     try:
-        with open(
-            LIBRARY_FILE,
-            "w",
-            encoding="utf-8"
-        ) as f:
-            json.dump(
-                tracks,
-                f,
-                indent=4,
-                ensure_ascii=False
-            )
+        with open(LIBRARY_FILE, "w", encoding="utf-8") as f:
+            json.dump(tracks, f, indent=4, ensure_ascii=False)
 
         return True
 
@@ -182,354 +183,49 @@ def find_file_by_name(filename):
 # ============================================================
 
 def normalize_audio(audio):
-    audio = np.asarray(
-        audio,
-        dtype=np.float32
-    )
+    audio = np.asarray(audio, dtype=np.float32)
 
     if audio.size == 0:
         return audio
 
-    peak = np.max(
-        np.abs(audio)
-    )
+    peak = np.max(np.abs(audio))
 
     if peak > 0:
-        audio = (
-            audio / peak
-        ) * 0.95
+        audio = (audio / peak) * 0.95
 
-    return audio.astype(
-        np.float32
-    )
+    return audio.astype(np.float32)
 
 
-def crossfade_audio(
-    first,
-    second,
-    sampling_rate,
-    crossfade_seconds=0.5
-):
-    first = np.asarray(
-        first,
-        dtype=np.float32
-    )
+def crossfade_audio(first, second, sampling_rate, crossfade_seconds=0.5):
+    first = np.asarray(first, dtype=np.float32)
+    second = np.asarray(second, dtype=np.float32)
 
-    second = np.asarray(
-        second,
-        dtype=np.float32
-    )
-
-    crossfade_samples = int(
-        sampling_rate
-        * crossfade_seconds
-    )
-
-    crossfade_samples = min(
-        crossfade_samples,
-        len(first),
-        len(second)
-    )
+    crossfade_samples = int(sampling_rate * crossfade_seconds)
+    crossfade_samples = min(crossfade_samples, len(first), len(second))
 
     if crossfade_samples <= 0:
-        return np.concatenate(
-            [first, second]
-        )
+        return np.concatenate([first, second])
 
-    first_main = first[
-        :-crossfade_samples
-    ]
+    first_main = first[:-crossfade_samples]
+    first_tail = first[-crossfade_samples:]
 
-    first_tail = first[
-        -crossfade_samples:
-    ]
+    second_head = second[:crossfade_samples]
+    second_rest = second[crossfade_samples:]
 
-    second_head = second[
-        :crossfade_samples
-    ]
+    fade_out = np.linspace(1.0, 0.0, crossfade_samples, dtype=np.float32)
+    fade_in = np.linspace(0.0, 1.0, crossfade_samples, dtype=np.float32)
 
-    second_rest = second[
-        crossfade_samples:
-    ]
+    blended = first_tail * fade_out + second_head * fade_in
 
-    fade_out = np.linspace(
-        1.0,
-        0.0,
-        crossfade_samples,
-        dtype=np.float32
-    )
-
-    fade_in = np.linspace(
-        0.0,
-        1.0,
-        crossfade_samples,
-        dtype=np.float32
-    )
-
-    blended = (
-        first_tail * fade_out
-        +
-        second_head * fade_in
-    )
-
-    return np.concatenate(
-        [
-            first_main,
-            blended,
-            second_rest
-        ]
-    )
-
-
-# ============================================================
-# REPLICATE REQUEST
-# ============================================================
-
-def create_replicate_prediction(
-    prompt,
-    duration_seconds,
-    temperature
-):
-    if not REPLICATE_API_TOKEN:
-
-        raise RuntimeError(
-            "REPLICATE_API_TOKEN is not configured in Railway Variables."
-        )
-
-    duration_seconds = int(
-        max(
-            5,
-            min(
-                int(duration_seconds),
-                30
-            )
-        )
-    )
-
-    headers = {
-        "Authorization":
-            f"Bearer {REPLICATE_API_TOKEN}",
-
-        "Content-Type":
-            "application/json",
-
-        "Prefer":
-            "wait=1"
-    }
-
-    payload = {
-        "version":
-            REPLICATE_MODEL_VERSION,
-
-        "input": {
-            "prompt":
-                prompt,
-
-            "duration":
-                duration_seconds,
-
-            "temperature":
-                float(temperature),
-
-            "output_format":
-                "wav",
-
-            "normalization_strategy":
-                "loudness",
-
-            "classifier_free_guidance":
-                3
-        }
-    }
-
-    response = requests.post(
-        REPLICATE_API_URL,
-        headers=headers,
-        json=payload,
-        timeout=90
-    )
-
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"Replicate API error "
-            f"{response.status_code}: "
-            f"{response.text}"
-        )
-
-    return response.json()
-
-
-# ============================================================
-# WAIT FOR REPLICATE PREDICTION
-# ============================================================
-
-def wait_for_prediction(prediction):
-    status = prediction.get(
-        "status"
-    )
-
-    prediction_url = (
-        prediction.get(
-            "urls",
-            {}
-        ).get("get")
-    )
-
-    if not prediction_url:
-        prediction_id = prediction.get("id")
-
-        if not prediction_id:
-            raise RuntimeError(
-                "Replicate did not return a prediction ID."
-            )
-
-        prediction_url = (
-            f"{REPLICATE_API_URL}/{prediction_id}"
-        )
-
-    headers = {
-        "Authorization":
-            f"Bearer {REPLICATE_API_TOKEN}"
-    }
-
-    while status not in (
-        "succeeded",
-        "failed",
-        "canceled"
-    ):
-
-        time.sleep(2)
-
-        response = requests.get(
-            prediction_url,
-            headers=headers,
-            timeout=30
-        )
-
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"Replicate status error "
-                f"{response.status_code}: "
-                f"{response.text}"
-            )
-
-        prediction = response.json()
-
-        status = prediction.get(
-            "status"
-        )
-
-    if status != "succeeded":
-
-        error_message = (
-            prediction.get("error")
-            or
-            f"Replicate prediction {status}."
-        )
-
-        raise RuntimeError(
-            str(error_message)
-        )
-
-    return prediction
-
-
-# ============================================================
-# GET OUTPUT URL
-# ============================================================
-
-def get_output_url(prediction):
-    output = prediction.get(
-        "output"
-    )
-
-    if isinstance(
-        output,
-        str
-    ):
-        return output
-
-    if isinstance(
-        output,
-        list
-    ) and output:
-
-        first = output[0]
-
-        if isinstance(
-            first,
-            str
-        ):
-            return first
-
-        if isinstance(
-            first,
-            dict
-        ):
-            if first.get("url"):
-                return first["url"]
-
-    if isinstance(
-        output,
-        dict
-    ):
-
-        if output.get("url"):
-            return output["url"]
-
-    raise RuntimeError(
-        "Replicate completed the prediction but did not return an audio URL."
-    )
-
-
-# ============================================================
-# DOWNLOAD GENERATED AUDIO
-# ============================================================
-
-def download_audio(
-    audio_url,
-    output_path
-):
-    response = requests.get(
-        audio_url,
-        timeout=120
-    )
-
-    response.raise_for_status()
-
-    with open(
-        output_path,
-        "wb"
-    ) as f:
-        f.write(
-            response.content
-        )
-
-    if not output_path.exists():
-        raise RuntimeError(
-            "Generated audio file was not saved."
-        )
+    return np.concatenate([first_main, blended, second_rest])
 
 
 # ============================================================
 # GENERATE ONE CHUNK
 # ============================================================
 
-def generate_one_chunk(
-    prompt,
-    genre,
-    duration_seconds,
-    creativity
-):
-    duration_seconds = int(
-        max(
-            5,
-            min(
-                int(duration_seconds),
-                30
-            )
-        )
-    )
+def generate_one_chunk(prompt, genre, duration_seconds, temperature):
+    duration_seconds = max(1.0, min(float(duration_seconds), 30.0))
 
     full_prompt = (
         f"{genre} instrumental music. "
@@ -540,163 +236,75 @@ def generate_one_chunk(
         f"natural dynamics and musical progression."
     )
 
-    print()
-    print(
-        f"Generating {duration_seconds}s "
-        f"through Replicate..."
+    print(f"Generating {duration_seconds:.2f}s chunk...")
+
+    inputs = processor(
+        text=[full_prompt],
+        padding=True,
+        return_tensors="pt"
     )
 
-    prediction = create_replicate_prediction(
-        full_prompt,
-        duration_seconds,
-        creativity
-    )
+    max_new_tokens = int(np.ceil(duration_seconds * 50)) + 60
 
-    prediction = wait_for_prediction(
-        prediction
-    )
+    print(f"Max tokens: {max_new_tokens}")
 
-    output_url = get_output_url(
-        prediction
-    )
-
-    response = requests.get(
-        output_url,
-        timeout=120
-    )
-
-    response.raise_for_status()
-
-    temp_path = (
-        GENERATED_DIR
-        /
-        f"temp_{uuid.uuid4().hex}.wav"
-    )
-
-    with open(
-        temp_path,
-        "wb"
-    ) as f:
-        f.write(
-            response.content
+    with torch.no_grad():
+        audio_values = model.generate(
+            **inputs,
+            do_sample=True,
+            temperature=temperature,
+            guidance_scale=3.0,
+            max_new_tokens=max_new_tokens
         )
 
-    sample_rate, audio = (
-        scipy.io.wavfile.read(
-            str(temp_path)
-        )
-    )
+    audio = audio_values[0].cpu().numpy()
+    audio = np.squeeze(audio)
 
-    try:
-        temp_path.unlink()
-    except Exception:
-        pass
-
-    audio = np.asarray(
-        audio,
-        dtype=np.float32
-    )
-
-    # Convert stereo to mono for simple
-    # consistent browser playback.
     if audio.ndim > 1:
-        audio = np.mean(
-            audio,
-            axis=1
-        )
+        audio = audio[0]
 
-    audio = normalize_audio(
-        audio
-    )
-
-    target_samples = (
-        sample_rate
-        * duration_seconds
-    )
-
-    if len(audio) > target_samples:
-        audio = audio[
-            :target_samples
-        ]
-
-    return (
-        audio,
-        sample_rate
-    )
+    return audio.astype(np.float32)
 
 
 # ============================================================
 # GENERATE REQUESTED DURATION
 # ============================================================
 
-def generate_requested_audio(
-    prompt,
-    genre,
-    creativity,
-    requested_duration
-):
-    requested_duration = int(
-        max(
-            5,
-            min(
-                int(requested_duration),
-                300
-            )
-        )
-    )
+def generate_requested_audio(prompt, genre, creativity, requested_duration):
+    requested_duration = int(max(5, min(int(requested_duration), 300)))
 
     chunks = []
-
     remaining = requested_duration
-
     chunk_number = 1
 
     while remaining > 0:
-
-        chunk_duration = min(
-            remaining,
-            30
-        )
+        chunk_duration = min(remaining, 30)
 
         chunk_prompt = prompt
 
         if chunk_number > 1:
             chunk_prompt = (
                 prompt
-                +
-                ". Continue the composition with "
-                "fresh musical development and variation. "
+                + ". Continue the composition with fresh musical development and variation. "
                 "Avoid simply repeating the previous section."
             )
 
-        audio, sample_rate = (
-            generate_one_chunk(
-                chunk_prompt,
-                genre,
-                chunk_duration,
-                creativity
-            )
+        audio = generate_one_chunk(
+            chunk_prompt,
+            genre,
+            chunk_duration,
+            creativity
         )
 
-        chunks.append(
-            (audio, sample_rate)
-        )
-
+        chunks.append(audio)
         remaining -= chunk_duration
-
         chunk_number += 1
 
-    sample_rate = chunks[0][1]
+    sample_rate = int(model.config.audio_encoder.sampling_rate)
 
-    final_audio = chunks[0][0]
+    final_audio = chunks[0]
 
-    for audio, current_rate in chunks[1:]:
-
-        if current_rate != sample_rate:
-            raise RuntimeError(
-                "Generated audio sample rates do not match."
-            )
-
+    for audio in chunks[1:]:
         final_audio = crossfade_audio(
             final_audio,
             audio,
@@ -704,164 +312,81 @@ def generate_requested_audio(
             crossfade_seconds=0.5
         )
 
-    target_samples = (
-        sample_rate
-        * requested_duration
-    )
+    target_samples = sample_rate * requested_duration
 
     if len(final_audio) > target_samples:
-        final_audio = final_audio[
-            :target_samples
-        ]
+        final_audio = final_audio[:target_samples]
 
-    return (
-        normalize_audio(final_audio),
-        sample_rate
-    )
+    return (normalize_audio(final_audio), sample_rate)
 
 
 # ============================================================
 # BACKGROUND GENERATION JOB
 # ============================================================
 
-def run_generation_job(
-    job_id,
-    prompt,
-    genre,
-    creativity,
-    requested_duration
-):
+def run_generation_job(job_id, prompt, genre, creativity, requested_duration):
     try:
 
         with generation_jobs_lock:
             generation_jobs[job_id] = {
                 "status": "generating",
-                "message":
-                    "AI is generating your music.",
+                "message": "AI is generating your music.",
                 "track": None
             }
 
-        with generation_lock:
-
-            audio, sample_rate = (
-                generate_requested_audio(
-                    prompt,
-                    genre,
-                    creativity,
-                    requested_duration
-                )
+        with model_lock:
+            audio, sample_rate = generate_requested_audio(
+                prompt,
+                genre,
+                creativity,
+                requested_duration
             )
 
-        filename = (
-            f"ai_generated_{job_id}.wav"
-        )
+        filename = f"ai_generated_{job_id}.wav"
+        output_path = GENERATED_DIR / filename
 
-        output_path = (
-            GENERATED_DIR
-            / filename
-        )
-
-        scipy.io.wavfile.write(
-            str(output_path),
-            sample_rate,
-            audio
-        )
+        scipy.io.wavfile.write(str(output_path), sample_rate, audio)
 
         if not output_path.exists():
-            raise RuntimeError(
-                "Generated WAV file was not created."
-            )
+            raise RuntimeError("Generated WAV file was not created.")
 
-        actual_duration = (
-            len(audio)
-            / sample_rate
-        )
+        actual_duration = len(audio) / sample_rate
+        minutes = int(actual_duration // 60)
+        seconds = int(actual_duration % 60)
+        duration_text = f"{minutes}:{seconds:02d}"
 
-        minutes = int(
-            actual_duration // 60
-        )
-
-        seconds = int(
-            actual_duration % 60
-        )
-
-        duration_text = (
-            f"{minutes}:{seconds:02d}"
-        )
-
-        audio_url = (
-            f"/generated/{filename}"
-        )
+        audio_url = f"/generated/{filename}"
 
         track = {
-            "id":
-                job_id,
-
-            "title":
-                "AI Generated Track",
-
-            "genre":
-                genre,
-
-            "icon":
-                "🎵",
-
-            "file":
-                audio_url,
-
-            "audio_url":
-                audio_url,
-
-            "duration":
-                duration_text,
-
-            "prompt":
-                prompt,
-
-            "created_at":
-                datetime.now().isoformat()
+            "id": job_id,
+            "title": "AI Generated Track",
+            "genre": genre,
+            "icon": "🎵",
+            "file": audio_url,
+            "audio_url": audio_url,
+            "duration": duration_text,
+            "prompt": prompt,
+            "created_at": datetime.now().isoformat()
         }
 
         library = load_library()
-
-        library.insert(
-            0,
-            track
-        )
-
-        save_library(
-            library
-        )
+        library.insert(0, track)
+        save_library(library)
 
         with generation_jobs_lock:
-
             generation_jobs[job_id] = {
-                "status":
-                    "completed",
-
-                "message":
-                    "Music generated successfully.",
-
-                "track":
-                    track
+                "status": "completed",
+                "message": "Music generated successfully.",
+                "track": track
             }
 
         print()
         print("=" * 70)
         print("GENERATION SUCCESSFUL")
         print("=" * 70)
-        print(
-            "Job ID:",
-            job_id
-        )
-        print(
-            "File:",
-            output_path
-        )
-        print(
-            "Duration:",
-            duration_text
-        )
+        print("Job ID:", job_id)
+        print("File:", output_path)
+        print("Duration:", duration_text)
         print("=" * 70)
 
     except Exception as e:
@@ -869,16 +394,10 @@ def run_generation_job(
         traceback.print_exc()
 
         with generation_jobs_lock:
-
             generation_jobs[job_id] = {
-                "status":
-                    "failed",
-
-                "message":
-                    str(e),
-
-                "track":
-                    None
+                "status": "failed",
+                "message": str(e),
+                "track": None
             }
 
 
@@ -888,10 +407,7 @@ def run_generation_job(
 
 @app.route("/")
 def home():
-    return send_from_directory(
-        BASE_DIR,
-        "SoundForge.html"
-    )
+    return send_from_directory(BASE_DIR, "SoundForge.html")
 
 
 # ============================================================
@@ -900,10 +416,7 @@ def home():
 
 @app.route("/style.css")
 def css():
-    return send_from_directory(
-        BASE_DIR,
-        "style.css"
-    )
+    return send_from_directory(BASE_DIR, "style.css")
 
 
 # ============================================================
@@ -912,27 +425,19 @@ def css():
 
 @app.route("/script.js")
 def javascript():
-    return send_from_directory(
-        BASE_DIR,
-        "script.js"
-    )
+    return send_from_directory(BASE_DIR, "script.js")
 
 
 # ============================================================
 # ORIGINAL AUDIO
 # ============================================================
 
-@app.route(
-    "/audio/<path:filename>"
-)
+@app.route("/audio/<path:filename>")
 def original_audio(filename):
 
-    found_file = find_file_by_name(
-        filename
-    )
+    found_file = find_file_by_name(filename)
 
     if found_file:
-
         return send_from_directory(
             found_file.parent,
             found_file.name,
@@ -940,14 +445,9 @@ def original_audio(filename):
         )
 
     return jsonify({
-        "success":
-            False,
-
-        "error":
-            "Original audio file not found.",
-
-        "filename":
-            filename
+        "success": False,
+        "error": "Original audio file not found.",
+        "filename": filename
     }), 404
 
 
@@ -955,24 +455,15 @@ def original_audio(filename):
 # GENERATED AUDIO
 # ============================================================
 
-@app.route(
-    "/generated/<path:filename>"
-)
+@app.route("/generated/<path:filename>")
 def generated_audio(filename):
 
-    file_path = (
-        GENERATED_DIR
-        / Path(filename).name
-    )
+    file_path = GENERATED_DIR / Path(filename).name
 
     if not file_path.exists():
-
         return jsonify({
-            "success":
-                False,
-
-            "error":
-                "Generated audio file not found."
+            "success": False,
+            "error": "Generated audio file not found."
         }), 404
 
     return send_from_directory(
@@ -986,18 +477,12 @@ def generated_audio(filename):
 # LIBRARY
 # ============================================================
 
-@app.route(
-    "/api/library",
-    methods=["GET"]
-)
+@app.route("/api/library", methods=["GET"])
 def get_library():
 
     return jsonify({
-        "success":
-            True,
-
-        "tracks":
-            load_library()
+        "success": True,
+        "tracks": load_library()
     })
 
 
@@ -1005,58 +490,28 @@ def get_library():
 # HEALTH
 # ============================================================
 
-@app.route(
-    "/api/health",
-    methods=["GET"]
-)
+@app.route("/api/health", methods=["GET"])
 def health():
 
     original_files = []
 
     for track in ORIGINAL_TRACKS:
-
-        found = find_file_by_name(
-            track["file"]
-        )
-
+        found = find_file_by_name(track["file"])
         original_files.append({
-            "file":
-                track["file"],
-
-            "exists":
-                found is not None
+            "file": track["file"],
+            "exists": found is not None
         })
 
     return jsonify({
-
-        "online":
-            True,
-
-        "project":
-            "SoundForge",
-
-        "ai_provider":
-            "Replicate",
-
-        "model":
-            "meta/musicgen",
-
-        "token_configured":
-            bool(
-                REPLICATE_API_TOKEN
-            ),
-
-        "original_tracks":
-            len(ORIGINAL_TRACKS),
-
-        "original_files":
-            original_files,
-
-        "library_tracks":
-            len(load_library()),
-
-        "duration_support":
-            "5-300 seconds"
+        "online": True,
+        "project": "SoundForge",
+        "ai_provider": "Local MusicGen",
+        "model": MODEL_NAME,
+        "model_loaded": model is not None,
+        "original_tracks": len(ORIGINAL_TRACKS),
+        "original_files": original_files,
+        "library_tracks": len(load_library()),
+        "duration_support": "5-300 seconds"
     })
 
 
@@ -1064,30 +519,20 @@ def health():
 # ORIGINAL TRACK API
 # ============================================================
 
-@app.route(
-    "/api/tracks",
-    methods=["GET"]
-)
+@app.route("/api/tracks", methods=["GET"])
 def get_tracks():
 
     tracks = []
 
     for track in ORIGINAL_TRACKS:
-
         tracks.append({
             **track,
-            "file":
-                "/audio/"
-                +
-                track["file"]
+            "file": "/audio/" + track["file"]
         })
 
     return jsonify({
-        "success":
-            True,
-
-        "tracks":
-            tracks
+        "success": True,
+        "tracks": tracks
     })
 
 
@@ -1095,153 +540,64 @@ def get_tracks():
 # START GENERATION
 # ============================================================
 
-@app.route(
-    "/api/generate",
-    methods=["POST"]
-)
+@app.route("/api/generate", methods=["POST"])
 def start_generation():
 
     try:
 
-        data = (
-            request.get_json(
-                silent=True
-            )
-            or {}
-        )
+        data = request.get_json(silent=True) or {}
 
-        prompt = str(
-            data.get(
-                "prompt",
-                ""
-            )
-        ).strip()
-
-        genre = str(
-            data.get(
-                "genre",
-                ""
-            )
-        ).strip()
+        prompt = str(data.get("prompt", "")).strip()
+        genre = str(data.get("genre", "")).strip()
 
         try:
-            requested_duration = int(
-                float(
-                    data.get(
-                        "duration",
-                        10
-                    )
-                )
-            )
-        except (
-            TypeError,
-            ValueError
-        ):
+            requested_duration = int(float(data.get("duration", 10)))
+        except (TypeError, ValueError):
             requested_duration = 10
 
-        requested_duration = max(
-            5,
-            min(
-                requested_duration,
-                300
-            )
-        )
+        requested_duration = max(5, min(requested_duration, 300))
 
         try:
-            creativity = float(
-                data.get(
-                    "creativity",
-                    0.8
-                )
-            )
-        except (
-            TypeError,
-            ValueError
-        ):
+            creativity = float(data.get("creativity", 0.8))
+        except (TypeError, ValueError):
             creativity = 0.8
 
-        creativity = max(
-            0.5,
-            min(
-                creativity,
-                1.5
-            )
-        )
+        creativity = max(0.5, min(creativity, 1.5))
 
         if not prompt:
-
             return jsonify({
-                "success":
-                    False,
-
-                "error":
-                    "Please enter a music prompt."
+                "success": False,
+                "error": "Please enter a music prompt."
             }), 400
 
         if not genre:
-
             return jsonify({
-                "success":
-                    False,
-
-                "error":
-                    "Please choose a genre."
+                "success": False,
+                "error": "Please choose a genre."
             }), 400
-
-        if not REPLICATE_API_TOKEN:
-
-            return jsonify({
-                "success":
-                    False,
-
-                "error":
-                    "AI generation is not configured. Add REPLICATE_API_TOKEN to Railway Variables."
-            }), 500
 
         job_id = uuid.uuid4().hex[:10]
 
         with generation_jobs_lock:
-
             generation_jobs[job_id] = {
-                "status":
-                    "queued",
-
-                "message":
-                    "Generation queued.",
-
-                "track":
-                    None
+                "status": "queued",
+                "message": "Generation queued.",
+                "track": None
             }
 
         worker = threading.Thread(
             target=run_generation_job,
-
-            args=(
-                job_id,
-                prompt,
-                genre,
-                creativity,
-                requested_duration
-            ),
-
+            args=(job_id, prompt, genre, creativity, requested_duration),
             daemon=True
         )
 
         worker.start()
 
         return jsonify({
-
-            "success":
-                True,
-
-            "job_id":
-                job_id,
-
-            "status":
-                "queued",
-
-            "message":
-                "Music generation started."
+            "success": True,
+            "job_id": job_id,
+            "status": "queued",
+            "message": "Music generation started."
         }), 202
 
     except Exception as e:
@@ -1249,12 +605,8 @@ def start_generation():
         traceback.print_exc()
 
         return jsonify({
-
-            "success":
-                False,
-
-            "error":
-                str(e)
+            "success": False,
+            "error": str(e)
         }), 500
 
 
@@ -1262,53 +614,24 @@ def start_generation():
 # GENERATION STATUS
 # ============================================================
 
-@app.route(
-    "/api/generation-status/<job_id>",
-    methods=["GET"]
-)
+@app.route("/api/generation-status/<job_id>", methods=["GET"])
 def generation_status(job_id):
 
     with generation_jobs_lock:
-
-        job = generation_jobs.get(
-            job_id
-        )
+        job = generation_jobs.get(job_id)
 
     if job is None:
-
         return jsonify({
-
-            "success":
-                False,
-
-            "error":
-                "Generation job not found."
+            "success": False,
+            "error": "Generation job not found."
         }), 404
 
     return jsonify({
-
-        "success":
-            True,
-
-        "job_id":
-            job_id,
-
-        "status":
-            job.get(
-                "status",
-                "unknown"
-            ),
-
-        "message":
-            job.get(
-                "message",
-                ""
-            ),
-
-        "track":
-            job.get(
-                "track"
-            )
+        "success": True,
+        "job_id": job_id,
+        "status": job.get("status", "unknown"),
+        "message": job.get("message", ""),
+        "track": job.get("track")
     })
 
 
@@ -1318,12 +641,10 @@ def generation_status(job_id):
 
 if __name__ == "__main__":
 
-    port = int(
-        os.environ.get(
-            "PORT",
-            5000
-        )
-    )
+    # Load model on startup
+    load_musicgen()
+
+    port = int(os.environ.get("PORT", 5000))
 
     print()
     print("=" * 70)
@@ -1331,24 +652,12 @@ if __name__ == "__main__":
     print("=" * 70)
     print("Host: 0.0.0.0")
     print("Port:", port)
-    print("AI Provider: Replicate")
-    print("Model: meta/musicgen")
-    print(
-        "Original tracks:",
-        len(ORIGINAL_TRACKS)
-    )
-    print(
-        "Library:",
-        LIBRARY_FILE
-    )
-    print(
-        "Generated folder:",
-        GENERATED_DIR
-    )
-    print(
-        "Duration support:",
-        "5-300 seconds"
-    )
+    print("AI Provider: Local MusicGen")
+    print("Model:", MODEL_NAME)
+    print("Original tracks:", len(ORIGINAL_TRACKS))
+    print("Library:", LIBRARY_FILE)
+    print("Generated folder:", GENERATED_DIR)
+    print("Duration support: 5-300 seconds")
     print("=" * 70)
     print()
 
