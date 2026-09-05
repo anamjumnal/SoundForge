@@ -7,19 +7,16 @@ import threading
 import traceback
 import json
 import os
-
 import numpy as np
 import scipy.io.wavfile
 import torch
 from transformers import AutoProcessor, MusicgenForConditionalGeneration
-
 
 # ============================================================
 # SOUNDFORGE - LOCAL MUSICGEN
 # ============================================================
 
 app = Flask(__name__)
-
 CORS(
     app,
     resources={
@@ -30,12 +27,9 @@ CORS(
 )
 
 BASE_DIR = Path(__file__).resolve().parent
-
 GENERATED_DIR = BASE_DIR / "generated"
 GENERATED_DIR.mkdir(exist_ok=True)
-
 LIBRARY_FILE = BASE_DIR / "library.json"
-
 
 # ============================================================
 # ORIGINAL 4 TRACKS
@@ -76,7 +70,6 @@ ORIGINAL_TRACKS = [
     }
 ]
 
-
 # ============================================================
 # JOB STATE
 # ============================================================
@@ -85,7 +78,6 @@ generation_jobs = {}
 generation_jobs_lock = threading.Lock()
 model_lock = threading.Lock()
 
-
 # ============================================================
 # MUSICGEN MODEL
 # ============================================================
@@ -93,6 +85,10 @@ model_lock = threading.Lock()
 MODEL_NAME = "facebook/musicgen-small"
 processor = None
 model = None
+
+# Tracks background loading status so /api/health and /api/generate
+# can report real state instead of the server just dying silently.
+model_loading_status = {"loaded": False, "loading": False, "error": None}
 
 
 def load_musicgen():
@@ -122,6 +118,21 @@ def load_musicgen():
     print()
 
 
+def load_musicgen_background():
+    """Runs in a separate thread so app.run() can bind to the port
+    immediately instead of waiting on the model download/load first."""
+    model_loading_status["loading"] = True
+    try:
+        load_musicgen()
+        model_loading_status["loaded"] = True
+        model_loading_status["error"] = None
+    except Exception as e:
+        traceback.print_exc()
+        model_loading_status["error"] = str(e)
+    finally:
+        model_loading_status["loading"] = False
+
+
 # ============================================================
 # LIBRARY
 # ============================================================
@@ -129,17 +140,13 @@ def load_musicgen():
 def load_library():
     if not LIBRARY_FILE.exists():
         return []
-
     try:
         with open(LIBRARY_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-
-        if isinstance(data, list):
-            return data
-
+            if isinstance(data, list):
+                return data
     except Exception:
         traceback.print_exc()
-
     return []
 
 
@@ -147,9 +154,7 @@ def save_library(tracks):
     try:
         with open(LIBRARY_FILE, "w", encoding="utf-8") as f:
             json.dump(tracks, f, indent=4, ensure_ascii=False)
-
         return True
-
     except Exception:
         traceback.print_exc()
         return False
@@ -161,20 +166,15 @@ def save_library(tracks):
 
 def find_file_by_name(filename):
     filename = Path(filename).name
-
     direct = BASE_DIR / filename
-
     if direct.is_file():
         return direct
-
     try:
         for candidate in BASE_DIR.rglob(filename):
             if candidate.is_file():
                 return candidate
-
     except Exception:
         traceback.print_exc()
-
     return None
 
 
@@ -184,15 +184,11 @@ def find_file_by_name(filename):
 
 def normalize_audio(audio):
     audio = np.asarray(audio, dtype=np.float32)
-
     if audio.size == 0:
         return audio
-
     peak = np.max(np.abs(audio))
-
     if peak > 0:
         audio = (audio / peak) * 0.95
-
     return audio.astype(np.float32)
 
 
@@ -208,7 +204,6 @@ def crossfade_audio(first, second, sampling_rate, crossfade_seconds=0.5):
 
     first_main = first[:-crossfade_samples]
     first_tail = first[-crossfade_samples:]
-
     second_head = second[:crossfade_samples]
     second_rest = second[crossfade_samples:]
 
@@ -245,7 +240,6 @@ def generate_one_chunk(prompt, genre, duration_seconds, temperature):
     )
 
     max_new_tokens = int(np.ceil(duration_seconds * 50)) + 60
-
     print(f"Max tokens: {max_new_tokens}")
 
     with torch.no_grad():
@@ -259,7 +253,6 @@ def generate_one_chunk(prompt, genre, duration_seconds, temperature):
 
     audio = audio_values[0].cpu().numpy()
     audio = np.squeeze(audio)
-
     if audio.ndim > 1:
         audio = audio[0]
 
@@ -281,7 +274,6 @@ def generate_requested_audio(prompt, genre, creativity, requested_duration):
         chunk_duration = min(remaining, 30)
 
         chunk_prompt = prompt
-
         if chunk_number > 1:
             chunk_prompt = (
                 prompt
@@ -303,7 +295,6 @@ def generate_requested_audio(prompt, genre, creativity, requested_duration):
     sample_rate = int(model.config.audio_encoder.sampling_rate)
 
     final_audio = chunks[0]
-
     for audio in chunks[1:]:
         final_audio = crossfade_audio(
             final_audio,
@@ -313,7 +304,6 @@ def generate_requested_audio(prompt, genre, creativity, requested_duration):
         )
 
     target_samples = sample_rate * requested_duration
-
     if len(final_audio) > target_samples:
         final_audio = final_audio[:target_samples]
 
@@ -326,7 +316,6 @@ def generate_requested_audio(prompt, genre, creativity, requested_duration):
 
 def run_generation_job(job_id, prompt, genre, creativity, requested_duration):
     try:
-
         with generation_jobs_lock:
             generation_jobs[job_id] = {
                 "status": "generating",
@@ -344,7 +333,6 @@ def run_generation_job(job_id, prompt, genre, creativity, requested_duration):
 
         filename = f"ai_generated_{job_id}.wav"
         output_path = GENERATED_DIR / filename
-
         scipy.io.wavfile.write(str(output_path), sample_rate, audio)
 
         if not output_path.exists():
@@ -390,9 +378,7 @@ def run_generation_job(job_id, prompt, genre, creativity, requested_duration):
         print("=" * 70)
 
     except Exception as e:
-
         traceback.print_exc()
-
         with generation_jobs_lock:
             generation_jobs[job_id] = {
                 "status": "failed",
@@ -434,16 +420,13 @@ def javascript():
 
 @app.route("/audio/<path:filename>")
 def original_audio(filename):
-
     found_file = find_file_by_name(filename)
-
     if found_file:
         return send_from_directory(
             found_file.parent,
             found_file.name,
             mimetype="audio/wav"
         )
-
     return jsonify({
         "success": False,
         "error": "Original audio file not found.",
@@ -457,15 +440,12 @@ def original_audio(filename):
 
 @app.route("/generated/<path:filename>")
 def generated_audio(filename):
-
     file_path = GENERATED_DIR / Path(filename).name
-
     if not file_path.exists():
         return jsonify({
             "success": False,
             "error": "Generated audio file not found."
         }), 404
-
     return send_from_directory(
         GENERATED_DIR,
         file_path.name,
@@ -479,7 +459,6 @@ def generated_audio(filename):
 
 @app.route("/api/library", methods=["GET"])
 def get_library():
-
     return jsonify({
         "success": True,
         "tracks": load_library()
@@ -492,9 +471,7 @@ def get_library():
 
 @app.route("/api/health", methods=["GET"])
 def health():
-
     original_files = []
-
     for track in ORIGINAL_TRACKS:
         found = find_file_by_name(track["file"])
         original_files.append({
@@ -507,7 +484,9 @@ def health():
         "project": "SoundForge",
         "ai_provider": "Local MusicGen",
         "model": MODEL_NAME,
-        "model_loaded": model is not None,
+        "model_loaded": model_loading_status["loaded"],
+        "model_loading": model_loading_status["loading"],
+        "model_error": model_loading_status["error"],
         "original_tracks": len(ORIGINAL_TRACKS),
         "original_files": original_files,
         "library_tracks": len(load_library()),
@@ -521,15 +500,12 @@ def health():
 
 @app.route("/api/tracks", methods=["GET"])
 def get_tracks():
-
     tracks = []
-
     for track in ORIGINAL_TRACKS:
         tracks.append({
             **track,
             "file": "/audio/" + track["file"]
         })
-
     return jsonify({
         "success": True,
         "tracks": tracks
@@ -542,8 +518,14 @@ def get_tracks():
 
 @app.route("/api/generate", methods=["POST"])
 def start_generation():
-
     try:
+        if not model_loading_status["loaded"]:
+            return jsonify({
+                "success": False,
+                "error": "Model is still loading. Please try again shortly."
+                         if model_loading_status["loading"]
+                         else f"Model failed to load: {model_loading_status['error']}"
+            }), 503
 
         data = request.get_json(silent=True) or {}
 
@@ -554,14 +536,12 @@ def start_generation():
             requested_duration = int(float(data.get("duration", 10)))
         except (TypeError, ValueError):
             requested_duration = 10
-
         requested_duration = max(5, min(requested_duration, 300))
 
         try:
             creativity = float(data.get("creativity", 0.8))
         except (TypeError, ValueError):
             creativity = 0.8
-
         creativity = max(0.5, min(creativity, 1.5))
 
         if not prompt:
@@ -590,7 +570,6 @@ def start_generation():
             args=(job_id, prompt, genre, creativity, requested_duration),
             daemon=True
         )
-
         worker.start()
 
         return jsonify({
@@ -601,9 +580,7 @@ def start_generation():
         }), 202
 
     except Exception as e:
-
         traceback.print_exc()
-
         return jsonify({
             "success": False,
             "error": str(e)
@@ -616,7 +593,6 @@ def start_generation():
 
 @app.route("/api/generation-status/<job_id>", methods=["GET"])
 def generation_status(job_id):
-
     with generation_jobs_lock:
         job = generation_jobs.get(job_id)
 
@@ -640,11 +616,15 @@ def generation_status(job_id):
 # ============================================================
 
 if __name__ == "__main__":
-
-    # Load model on startup
-    load_musicgen()
-
     port = int(os.environ.get("PORT", 5000))
+
+    # Load the model in the background so app.run() can bind to the
+    # port immediately. Railway (and most PaaS platforms) expect the
+    # process to start listening quickly; loading a multi-hundred-MB
+    # model first can blow the startup window or run the container
+    # out of memory before it ever binds, which shows up as a silent
+    # "Crashed" with no Python traceback.
+    threading.Thread(target=load_musicgen_background, daemon=True).start()
 
     print()
     print("=" * 70)
