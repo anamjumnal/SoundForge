@@ -6,6 +6,7 @@ import uuid
 import threading
 import traceback
 import json
+import os
 
 import numpy as np
 import scipy.io.wavfile
@@ -21,6 +22,7 @@ app = Flask(__name__)
 CORS(app)
 
 BASE_DIR = Path(__file__).resolve().parent
+
 GENERATED_DIR = BASE_DIR / "generated"
 GENERATED_DIR.mkdir(exist_ok=True)
 
@@ -29,6 +31,7 @@ LIBRARY_FILE = BASE_DIR / "library.json"
 
 # ============================================================
 # ORIGINAL 4 TRACKS
+# THESE ALWAYS STAY SEPARATE FROM MY LIBRARY
 # ============================================================
 
 ORIGINAL_TRACKS = [
@@ -106,8 +109,11 @@ def save_library(tracks):
                 ensure_ascii=False
             )
 
+        return True
+
     except Exception:
         traceback.print_exc()
+        return False
 
 
 # ============================================================
@@ -128,12 +134,12 @@ def load_musicgen():
     if processor is not None and model is not None:
         return
 
-    print("\n")
+    print()
     print("=" * 70)
     print("SOUNDFORGE - LOADING MUSICGEN")
     print("=" * 70)
     print("Model:", MODEL_NAME)
-    print("First load can take some time.")
+    print("First model load can take some time.")
     print("=" * 70)
 
     processor = AutoProcessor.from_pretrained(
@@ -150,15 +156,18 @@ def load_musicgen():
     print("=" * 70)
     print("MUSICGEN LOADED SUCCESSFULLY")
     print("=" * 70)
-    print("\n")
+    print()
 
 
 # ============================================================
 # GENERATE MUSIC CHUNK
 # ============================================================
 
-def generate_chunk(prompt, temperature, duration_seconds):
-
+def generate_chunk(
+    prompt,
+    temperature,
+    duration_seconds
+):
     duration_seconds = max(
         1.0,
         min(
@@ -173,9 +182,7 @@ def generate_chunk(prompt, temperature, duration_seconds):
         return_tensors="pt"
     )
 
-    # MusicGen is approximately 50 codec tokens/second.
-    # Generate extra tokens so that the requested duration
-    # is not accidentally shorter than requested.
+    # Approximately 50 codec tokens per second.
     max_new_tokens = int(
         np.ceil(duration_seconds * 50)
     ) + 60
@@ -208,11 +215,13 @@ def generate_chunk(prompt, temperature, duration_seconds):
 # ============================================================
 
 def normalize_audio(audio):
-
     audio = np.asarray(
         audio,
         dtype=np.float32
     )
+
+    if len(audio) == 0:
+        return audio
 
     peak = np.max(
         np.abs(audio)
@@ -227,7 +236,7 @@ def normalize_audio(audio):
 
 
 # ============================================================
-# JOIN AUDIO WITH CROSSFADE
+# CROSSFADE AUDIO
 # ============================================================
 
 def crossfade_audio(
@@ -236,7 +245,6 @@ def crossfade_audio(
     sampling_rate,
     crossfade_seconds=1.0
 ):
-
     crossfade_samples = int(
         sampling_rate * crossfade_seconds
     )
@@ -309,7 +317,6 @@ def create_track(
     temperature,
     requested_duration
 ):
-
     requested_duration = int(
         max(
             5,
@@ -328,7 +335,7 @@ def create_track(
         sampling_rate * requested_duration
     )
 
-    print("\n")
+    print()
     print("=" * 70)
     print(
         f"REQUESTED DURATION: "
@@ -348,11 +355,6 @@ def create_track(
             requested_duration + 1
         )
 
-        # ----------------------------------------------------
-        # If MusicGen produced less than requested,
-        # generate an actual AI continuation.
-        # ----------------------------------------------------
-
         if len(audio) < target_samples:
 
             current_duration = (
@@ -362,8 +364,7 @@ def create_track(
 
             missing_duration = (
                 requested_duration
-                -
-                current_duration
+                - current_duration
             )
 
             print(
@@ -387,7 +388,10 @@ def create_track(
             continuation = generate_chunk(
                 continuation_prompt,
                 temperature,
-                missing_duration + 1
+                min(
+                    30,
+                    missing_duration + 1
+                )
             )
 
             audio = np.concatenate(
@@ -397,28 +401,20 @@ def create_track(
                 ]
             )
 
-        # ----------------------------------------------------
-        # EXACT REQUESTED LENGTH
-        # ----------------------------------------------------
-
         audio = audio[
             :target_samples
         ]
 
-        # In the extremely unlikely event that the second
-        # generation was also slightly short, generate again.
         while len(audio) < target_samples:
 
             missing_samples = (
                 target_samples
-                -
-                len(audio)
+                - len(audio)
             )
 
             missing_seconds = (
                 missing_samples
-                /
-                sampling_rate
+                / sampling_rate
             )
 
             print(
@@ -487,11 +483,9 @@ def create_track(
         )
 
         if chunk_number == 1:
-
             chunk_prompt = prompt
 
         else:
-
             chunk_prompt = (
                 prompt
                 +
@@ -516,7 +510,7 @@ def create_track(
         chunk_number += 1
 
     # ========================================================
-    # JOIN REAL AI-GENERATED CHUNKS
+    # JOIN AI CHUNKS
     # ========================================================
 
     final_audio = chunks[0]
@@ -525,7 +519,6 @@ def create_track(
         1,
         len(chunks)
     ):
-
         print(
             f"Crossfading section {i + 1}..."
         )
@@ -545,20 +538,16 @@ def create_track(
         :target_samples
     ]
 
-    # If crossfading somehow caused a short result,
-    # generate another real AI continuation.
     while len(final_audio) < target_samples:
 
         missing_samples = (
             target_samples
-            -
-            len(final_audio)
+            - len(final_audio)
         )
 
         missing_seconds = (
             missing_samples
-            /
-            sampling_rate
+            / sampling_rate
         )
 
         continuation_prompt = (
@@ -601,12 +590,11 @@ def create_track(
 
 
 # ============================================================
-# HOME
+# HOME PAGE
 # ============================================================
 
 @app.route("/")
 def home():
-
     return send_from_directory(
         BASE_DIR,
         "SoundForge.html"
@@ -619,7 +607,6 @@ def home():
 
 @app.route("/style.css")
 def css():
-
     return send_from_directory(
         BASE_DIR,
         "style.css"
@@ -632,7 +619,6 @@ def css():
 
 @app.route("/script.js")
 def javascript():
-
     return send_from_directory(
         BASE_DIR,
         "script.js"
@@ -646,9 +632,7 @@ def javascript():
 @app.route("/audio/<path:filename>")
 def original_audio(filename):
 
-    root_file = (
-        BASE_DIR / filename
-    )
+    root_file = BASE_DIR / filename
 
     if root_file.exists():
 
@@ -658,13 +642,8 @@ def original_audio(filename):
             mimetype="audio/wav"
         )
 
-    audio_dir = (
-        BASE_DIR / "audio"
-    )
-
-    audio_file = (
-        audio_dir / filename
-    )
+    audio_dir = BASE_DIR / "audio"
+    audio_file = audio_dir / filename
 
     if audio_file.exists():
 
@@ -687,9 +666,7 @@ def original_audio(filename):
 @app.route("/generated/<path:filename>")
 def generated_audio(filename):
 
-    file_path = (
-        GENERATED_DIR / filename
-    )
+    file_path = GENERATED_DIR / filename
 
     if not file_path.exists():
 
@@ -716,7 +693,6 @@ def generated_audio(filename):
 def get_library():
 
     tracks = load_library()
-
     valid_tracks = []
 
     for track in tracks:
@@ -732,21 +708,13 @@ def get_library():
             filename
             and
             (
-                GENERATED_DIR
-                /
-                filename
+                GENERATED_DIR / filename
             ).exists()
         ):
-
-            valid_tracks.append(
-                track
-            )
+            valid_tracks.append(track)
 
     if len(valid_tracks) != len(tracks):
-
-        save_library(
-            valid_tracks
-        )
+        save_library(valid_tracks)
 
     return jsonify({
         "success": True,
@@ -755,7 +723,7 @@ def get_library():
 
 
 # ============================================================
-# HEALTH
+# HEALTH CHECK
 # ============================================================
 
 @app.route(
@@ -787,7 +755,10 @@ def health():
             True,
 
         "duration_support":
-            "5-300 seconds"
+            "5-300 seconds",
+
+        "railway":
+            True
     })
 
 
@@ -814,11 +785,8 @@ def get_tracks():
         })
 
     return jsonify({
-
         "success": True,
-
-        "tracks":
-            tracks
+        "tracks": tracks
     })
 
 
@@ -841,9 +809,9 @@ def generate_music():
             or {}
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # PROMPT
-        # ----------------------------------------------------
+        # ====================================================
 
         prompt = str(
             data.get(
@@ -852,9 +820,9 @@ def generate_music():
             )
         ).strip()
 
-        # ----------------------------------------------------
+        # ====================================================
         # GENRE
-        # ----------------------------------------------------
+        # ====================================================
 
         genre = str(
             data.get(
@@ -863,9 +831,9 @@ def generate_music():
             )
         ).strip()
 
-        # ----------------------------------------------------
+        # ====================================================
         # DURATION
-        # ----------------------------------------------------
+        # ====================================================
 
         try:
 
@@ -893,9 +861,9 @@ def generate_music():
             )
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # CREATIVITY
-        # ----------------------------------------------------
+        # ====================================================
 
         try:
 
@@ -921,9 +889,9 @@ def generate_music():
             )
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # VALIDATE PROMPT
-        # ----------------------------------------------------
+        # ====================================================
 
         if not prompt:
 
@@ -936,9 +904,9 @@ def generate_music():
 
             }), 400
 
-        # ----------------------------------------------------
+        # ====================================================
         # FULL PROMPT
-        # ----------------------------------------------------
+        # ====================================================
 
         full_prompt = (
             f"{genre} instrumental music. "
@@ -949,7 +917,7 @@ def generate_music():
             f"clear melody and coherent arrangement."
         )
 
-        print("\n")
+        print()
         print("=" * 70)
         print("NEW SOUNDFORGE AI GENERATION")
         print("=" * 70)
@@ -1012,7 +980,7 @@ def generate_music():
             )
 
         # ====================================================
-        # URL
+        # AUDIO URL
         # ====================================================
 
         audio_url = (
@@ -1025,8 +993,7 @@ def generate_music():
 
         actual_duration = (
             len(audio)
-            /
-            sampling_rate
+            / sampling_rate
         )
 
         minutes = int(
@@ -1076,7 +1043,7 @@ def generate_music():
         }
 
         # ====================================================
-        # PERMANENT LIBRARY
+        # SAVE TO MY LIBRARY ONLY
         # ====================================================
 
         library = load_library()
@@ -1086,15 +1053,17 @@ def generate_music():
             track
         )
 
-        save_library(
-            library
-        )
+        if not save_library(library):
+
+            print(
+                "WARNING: library.json could not be saved."
+            )
 
         # ====================================================
         # SUCCESS
         # ====================================================
 
-        print("\n")
+        print()
         print("=" * 70)
         print("GENERATION SUCCESSFUL")
         print("=" * 70)
@@ -1110,7 +1079,7 @@ def generate_music():
             "seconds"
         )
         print(
-            "Saved permanently to My Library."
+            "Saved to My Library."
         )
         print("=" * 70)
 
@@ -1128,7 +1097,7 @@ def generate_music():
 
     except Exception as e:
 
-        print("\n")
+        print()
         print("=" * 70)
         print("SOUNDFORGE MUSICGEN ERROR")
         print("=" * 70)
@@ -1149,19 +1118,33 @@ def generate_music():
 
 
 # ============================================================
-# START SERVER
+# RAILWAY / LOCAL SERVER STARTUP
 # ============================================================
 
 if __name__ == "__main__":
 
-    print("\n")
+    # Railway provides PORT automatically.
+    # Locally, it falls back to 5000.
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            5000
+        )
+    )
+
+    print()
     print("=" * 70)
     print("SOUNDFORGE AI MUSIC GENERATOR")
     print("=" * 70)
 
     print(
-        "Website: "
-        "http://127.0.0.1:5000"
+        "Host: 0.0.0.0"
+    )
+
+    print(
+        "Port:",
+        port
     )
 
     print(
@@ -1189,11 +1172,28 @@ if __name__ == "__main__":
         "5-300 seconds"
     )
 
+    print(
+        "Environment:",
+        "Railway"
+        if os.environ.get("RAILWAY_ENVIRONMENT")
+        else "Local"
+    )
+
     print("=" * 70)
-    print("\n")
+    print()
 
     app.run(
-        host="127.0.0.1",
-        port=5000,
-        debug=True
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        threaded=True
     )
+
+        
+
+
+
+    
+   
+
+  
