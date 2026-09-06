@@ -7,16 +7,20 @@ import threading
 import traceback
 import json
 import os
+import gc
+
 import numpy as np
 import scipy.io.wavfile
 import torch
 from transformers import AutoProcessor, MusicgenForConditionalGeneration
 
+
 # ============================================================
-# SOUNDFORGE - LOCAL MUSICGEN
+# SOUNDFORGE - LIGHTWEIGHT VERSION (Tiny Model)
 # ============================================================
 
 app = Flask(__name__)
+
 CORS(
     app,
     resources={
@@ -30,6 +34,7 @@ BASE_DIR = Path(__file__).resolve().parent
 GENERATED_DIR = BASE_DIR / "generated"
 GENERATED_DIR.mkdir(exist_ok=True)
 LIBRARY_FILE = BASE_DIR / "library.json"
+
 
 # ============================================================
 # ORIGINAL 4 TRACKS
@@ -70,6 +75,7 @@ ORIGINAL_TRACKS = [
     }
 ]
 
+
 # ============================================================
 # JOB STATE
 # ============================================================
@@ -78,16 +84,14 @@ generation_jobs = {}
 generation_jobs_lock = threading.Lock()
 model_lock = threading.Lock()
 
+
 # ============================================================
-# MUSICGEN MODEL
+# MUSICGEN TINY MODEL (LIGHTWEIGHT!)
 # ============================================================
 
-MODEL_NAME = "facebook/musicgen-small"
+MODEL_NAME = "facebook/musicgen-tiny"  # Much smaller than musicgen-small!
 processor = None
 model = None
-
-# Tracks background loading status so /api/health and /api/generate
-# can report real state instead of the server just dying silently.
 model_loading_status = {"loaded": False, "loading": False, "error": None}
 
 
@@ -99,28 +103,42 @@ def load_musicgen():
 
     print()
     print("=" * 70)
-    print("SOUNDFORGE - LOADING MUSICGEN")
+    print("SOUNDFORGE - LOADING LIGHTWEIGHT MUSICGEN")
     print("=" * 70)
     print("Model:", MODEL_NAME)
-    print("First model load can take some time.")
+    print("This is the tiny version (much smaller!)")
     print("=" * 70)
 
-    processor = AutoProcessor.from_pretrained(MODEL_NAME)
-    model = MusicgenForConditionalGeneration.from_pretrained(MODEL_NAME)
+    try:
+        # Load with memory optimization
+        processor = AutoProcessor.from_pretrained(MODEL_NAME)
+        
+        # Load model with reduced precision to save memory
+        model = MusicgenForConditionalGeneration.from_pretrained(
+            MODEL_NAME,
+            torch_dtype=torch.float16  # Use half precision
+        )
 
-    # Use CPU
-    model.to("cpu")
-    model.eval()
+        # Use CPU only
+        model.to("cpu")
+        model.eval()
 
-    print("=" * 70)
-    print("MUSICGEN LOADED SUCCESSFULLY")
-    print("=" * 70)
-    print()
+        # Clear cache
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        print("=" * 70)
+        print("MUSICGEN TINY LOADED SUCCESSFULLY")
+        print("=" * 70)
+        print()
+
+    except Exception as e:
+        traceback.print_exc()
+        raise e
 
 
 def load_musicgen_background():
-    """Runs in a separate thread so app.run() can bind to the port
-    immediately instead of waiting on the model download/load first."""
+    """Background loading so Flask can bind to port immediately"""
     model_loading_status["loading"] = True
     try:
         load_musicgen()
@@ -192,122 +210,52 @@ def normalize_audio(audio):
     return audio.astype(np.float32)
 
 
-def crossfade_audio(first, second, sampling_rate, crossfade_seconds=0.5):
-    first = np.asarray(first, dtype=np.float32)
-    second = np.asarray(second, dtype=np.float32)
-
-    crossfade_samples = int(sampling_rate * crossfade_seconds)
-    crossfade_samples = min(crossfade_samples, len(first), len(second))
-
-    if crossfade_samples <= 0:
-        return np.concatenate([first, second])
-
-    first_main = first[:-crossfade_samples]
-    first_tail = first[-crossfade_samples:]
-    second_head = second[:crossfade_samples]
-    second_rest = second[crossfade_samples:]
-
-    fade_out = np.linspace(1.0, 0.0, crossfade_samples, dtype=np.float32)
-    fade_in = np.linspace(0.0, 1.0, crossfade_samples, dtype=np.float32)
-
-    blended = first_tail * fade_out + second_head * fade_in
-
-    return np.concatenate([first_main, blended, second_rest])
-
-
 # ============================================================
-# GENERATE ONE CHUNK
+# GENERATE MUSIC (LIGHTWEIGHT)
 # ============================================================
 
-def generate_one_chunk(prompt, genre, duration_seconds, temperature):
-    duration_seconds = max(1.0, min(float(duration_seconds), 30.0))
+def generate_music_simple(prompt, genre, duration_seconds, temperature):
+    """Simplified generation for tiny model"""
+    duration_seconds = max(5.0, min(float(duration_seconds), 30.0))
 
     full_prompt = (
-        f"{genre} instrumental music. "
+        f"{genre} music. "
         f"{prompt}. "
-        f"No vocals. "
-        f"High quality musical composition. "
-        f"Clear melody, coherent arrangement, "
-        f"natural dynamics and musical progression."
+        f"No vocals."
     )
 
-    print(f"Generating {duration_seconds:.2f}s chunk...")
+    print(f"Generating {duration_seconds:.1f}s of {genre} music...")
 
+    # Process input
     inputs = processor(
         text=[full_prompt],
         padding=True,
         return_tensors="pt"
     )
 
-    max_new_tokens = int(np.ceil(duration_seconds * 50)) + 60
-    print(f"Max tokens: {max_new_tokens}")
+    # Reduce tokens for tiny model (it's slower)
+    max_new_tokens = int(duration_seconds * 25) + 30
 
+    print(f"Generating with {max_new_tokens} tokens...")
+
+    # Generate with reduced precision
     with torch.no_grad():
         audio_values = model.generate(
             **inputs,
             do_sample=True,
             temperature=temperature,
-            guidance_scale=3.0,
+            guidance_scale=1.0,  # Reduced guidance
             max_new_tokens=max_new_tokens
         )
 
+    # Convert to numpy
     audio = audio_values[0].cpu().numpy()
     audio = np.squeeze(audio)
+
     if audio.ndim > 1:
         audio = audio[0]
 
     return audio.astype(np.float32)
-
-
-# ============================================================
-# GENERATE REQUESTED DURATION
-# ============================================================
-
-def generate_requested_audio(prompt, genre, creativity, requested_duration):
-    requested_duration = int(max(5, min(int(requested_duration), 300)))
-
-    chunks = []
-    remaining = requested_duration
-    chunk_number = 1
-
-    while remaining > 0:
-        chunk_duration = min(remaining, 30)
-
-        chunk_prompt = prompt
-        if chunk_number > 1:
-            chunk_prompt = (
-                prompt
-                + ". Continue the composition with fresh musical development and variation. "
-                "Avoid simply repeating the previous section."
-            )
-
-        audio = generate_one_chunk(
-            chunk_prompt,
-            genre,
-            chunk_duration,
-            creativity
-        )
-
-        chunks.append(audio)
-        remaining -= chunk_duration
-        chunk_number += 1
-
-    sample_rate = int(model.config.audio_encoder.sampling_rate)
-
-    final_audio = chunks[0]
-    for audio in chunks[1:]:
-        final_audio = crossfade_audio(
-            final_audio,
-            audio,
-            sample_rate,
-            crossfade_seconds=0.5
-        )
-
-    target_samples = sample_rate * requested_duration
-    if len(final_audio) > target_samples:
-        final_audio = final_audio[:target_samples]
-
-    return (normalize_audio(final_audio), sample_rate)
 
 
 # ============================================================
@@ -323,16 +271,25 @@ def run_generation_job(job_id, prompt, genre, creativity, requested_duration):
                 "track": None
             }
 
+        # Cap duration for lightweight model
+        requested_duration = min(requested_duration, 30)
+
         with model_lock:
-            audio, sample_rate = generate_requested_audio(
+            audio = generate_music_simple(
                 prompt,
                 genre,
-                creativity,
-                requested_duration
+                requested_duration,
+                creativity
             )
 
+        # Normalize
+        audio = normalize_audio(audio)
+        sample_rate = int(model.config.audio_encoder.sampling_rate)
+
+        # Save
         filename = f"ai_generated_{job_id}.wav"
         output_path = GENERATED_DIR / filename
+
         scipy.io.wavfile.write(str(output_path), sample_rate, audio)
 
         if not output_path.exists():
@@ -377,6 +334,9 @@ def run_generation_job(job_id, prompt, genre, creativity, requested_duration):
         print("Duration:", duration_text)
         print("=" * 70)
 
+        # Clean up memory
+        gc.collect()
+
     except Exception as e:
         traceback.print_exc()
         with generation_jobs_lock:
@@ -388,7 +348,7 @@ def run_generation_job(job_id, prompt, genre, creativity, requested_duration):
 
 
 # ============================================================
-# HOME
+# ROUTES
 # ============================================================
 
 @app.route("/")
@@ -396,27 +356,15 @@ def home():
     return send_from_directory(BASE_DIR, "SoundForge.html")
 
 
-# ============================================================
-# CSS
-# ============================================================
-
 @app.route("/style.css")
 def css():
     return send_from_directory(BASE_DIR, "style.css")
 
 
-# ============================================================
-# JAVASCRIPT
-# ============================================================
-
 @app.route("/script.js")
 def javascript():
     return send_from_directory(BASE_DIR, "script.js")
 
-
-# ============================================================
-# ORIGINAL AUDIO
-# ============================================================
 
 @app.route("/audio/<path:filename>")
 def original_audio(filename):
@@ -434,10 +382,6 @@ def original_audio(filename):
     }), 404
 
 
-# ============================================================
-# GENERATED AUDIO
-# ============================================================
-
 @app.route("/generated/<path:filename>")
 def generated_audio(filename):
     file_path = GENERATED_DIR / Path(filename).name
@@ -453,10 +397,6 @@ def generated_audio(filename):
     )
 
 
-# ============================================================
-# LIBRARY
-# ============================================================
-
 @app.route("/api/library", methods=["GET"])
 def get_library():
     return jsonify({
@@ -464,10 +404,6 @@ def get_library():
         "tracks": load_library()
     })
 
-
-# ============================================================
-# HEALTH
-# ============================================================
 
 @app.route("/api/health", methods=["GET"])
 def health():
@@ -482,7 +418,7 @@ def health():
     return jsonify({
         "online": True,
         "project": "SoundForge",
-        "ai_provider": "Local MusicGen",
+        "ai_provider": "Local MusicGen Tiny",
         "model": MODEL_NAME,
         "model_loaded": model_loading_status["loaded"],
         "model_loading": model_loading_status["loading"],
@@ -490,13 +426,9 @@ def health():
         "original_tracks": len(ORIGINAL_TRACKS),
         "original_files": original_files,
         "library_tracks": len(load_library()),
-        "duration_support": "5-300 seconds"
+        "duration_support": "5-30 seconds (lightweight)"
     })
 
-
-# ============================================================
-# ORIGINAL TRACK API
-# ============================================================
 
 @app.route("/api/tracks", methods=["GET"])
 def get_tracks():
@@ -511,10 +443,6 @@ def get_tracks():
         "tracks": tracks
     })
 
-
-# ============================================================
-# START GENERATION
-# ============================================================
 
 @app.route("/api/generate", methods=["POST"])
 def start_generation():
@@ -536,12 +464,14 @@ def start_generation():
             requested_duration = int(float(data.get("duration", 10)))
         except (TypeError, ValueError):
             requested_duration = 10
-        requested_duration = max(5, min(requested_duration, 300))
+        
+        requested_duration = max(5, min(requested_duration, 30))
 
         try:
             creativity = float(data.get("creativity", 0.8))
         except (TypeError, ValueError):
             creativity = 0.8
+        
         creativity = max(0.5, min(creativity, 1.5))
 
         if not prompt:
@@ -587,10 +517,6 @@ def start_generation():
         }), 500
 
 
-# ============================================================
-# GENERATION STATUS
-# ============================================================
-
 @app.route("/api/generation-status/<job_id>", methods=["GET"])
 def generation_status(job_id):
     with generation_jobs_lock:
@@ -618,26 +544,19 @@ def generation_status(job_id):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
 
-    # Load the model in the background so app.run() can bind to the
-    # port immediately. Railway (and most PaaS platforms) expect the
-    # process to start listening quickly; loading a multi-hundred-MB
-    # model first can blow the startup window or run the container
-    # out of memory before it ever binds, which shows up as a silent
-    # "Crashed" with no Python traceback.
+    # Load model in background
     threading.Thread(target=load_musicgen_background, daemon=True).start()
 
     print()
     print("=" * 70)
-    print("SOUNDFORGE AI MUSIC GENERATOR")
+    print("SOUNDFORGE AI MUSIC GENERATOR (LIGHTWEIGHT)")
     print("=" * 70)
     print("Host: 0.0.0.0")
     print("Port:", port)
-    print("AI Provider: Local MusicGen")
+    print("AI Provider: Local MusicGen Tiny")
     print("Model:", MODEL_NAME)
-    print("Original tracks:", len(ORIGINAL_TRACKS))
-    print("Library:", LIBRARY_FILE)
-    print("Generated folder:", GENERATED_DIR)
-    print("Duration support: 5-300 seconds")
+    print("Memory: Optimized for 512MB (Render free tier)")
+    print("Duration: 5-30 seconds (lightweight)")
     print("=" * 70)
     print()
 
