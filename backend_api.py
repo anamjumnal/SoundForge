@@ -86,10 +86,10 @@ model_lock = threading.Lock()
 
 
 # ============================================================
-# MUSICGEN TINY MODEL (LIGHTWEIGHT!)
+# MUSICGEN TINY MODEL - LIGHTWEIGHT FOR FREE TIER
 # ============================================================
 
-MODEL_NAME = "facebook/musicgen-tiny"  # Much smaller than musicgen-small!
+MODEL_NAME = "facebook/musicgen-tiny"
 processor = None
 model = None
 model_loading_status = {"loaded": False, "loading": False, "error": None}
@@ -103,27 +103,23 @@ def load_musicgen():
 
     print()
     print("=" * 70)
-    print("SOUNDFORGE - LOADING LIGHTWEIGHT MUSICGEN")
+    print("SOUNDFORGE - LOADING MUSICGEN TINY")
     print("=" * 70)
-    print("Model:", MODEL_NAME)
-    print("This is the tiny version (much smaller!)")
+    print("Model: facebook/musicgen-tiny")
+    print("Loading lightweight model for free tier...")
     print("=" * 70)
 
     try:
-        # Load with memory optimization
         processor = AutoProcessor.from_pretrained(MODEL_NAME)
         
-        # Load model with reduced precision to save memory
         model = MusicgenForConditionalGeneration.from_pretrained(
             MODEL_NAME,
-            torch_dtype=torch.float16  # Use half precision
+            torch_dtype=torch.float16
         )
 
-        # Use CPU only
         model.to("cpu")
         model.eval()
 
-        # Clear cache
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -138,7 +134,6 @@ def load_musicgen():
 
 
 def load_musicgen_background():
-    """Background loading so Flask can bind to port immediately"""
     model_loading_status["loading"] = True
     try:
         load_musicgen()
@@ -211,11 +206,10 @@ def normalize_audio(audio):
 
 
 # ============================================================
-# GENERATE MUSIC (LIGHTWEIGHT)
+# GENERATE MUSIC
 # ============================================================
 
 def generate_music_simple(prompt, genre, duration_seconds, temperature):
-    """Simplified generation for tiny model"""
     duration_seconds = max(5.0, min(float(duration_seconds), 30.0))
 
     full_prompt = (
@@ -226,29 +220,25 @@ def generate_music_simple(prompt, genre, duration_seconds, temperature):
 
     print(f"Generating {duration_seconds:.1f}s of {genre} music...")
 
-    # Process input
     inputs = processor(
         text=[full_prompt],
         padding=True,
         return_tensors="pt"
     )
 
-    # Reduce tokens for tiny model (it's slower)
     max_new_tokens = int(duration_seconds * 25) + 30
 
     print(f"Generating with {max_new_tokens} tokens...")
 
-    # Generate with reduced precision
     with torch.no_grad():
         audio_values = model.generate(
             **inputs,
             do_sample=True,
             temperature=temperature,
-            guidance_scale=1.0,  # Reduced guidance
+            guidance_scale=1.0,
             max_new_tokens=max_new_tokens
         )
 
-    # Convert to numpy
     audio = audio_values[0].cpu().numpy()
     audio = np.squeeze(audio)
 
@@ -271,7 +261,6 @@ def run_generation_job(job_id, prompt, genre, creativity, requested_duration):
                 "track": None
             }
 
-        # Cap duration for lightweight model
         requested_duration = min(requested_duration, 30)
 
         with model_lock:
@@ -282,11 +271,9 @@ def run_generation_job(job_id, prompt, genre, creativity, requested_duration):
                 creativity
             )
 
-        # Normalize
         audio = normalize_audio(audio)
         sample_rate = int(model.config.audio_encoder.sampling_rate)
 
-        # Save
         filename = f"ai_generated_{job_id}.wav"
         output_path = GENERATED_DIR / filename
 
@@ -334,7 +321,6 @@ def run_generation_job(job_id, prompt, genre, creativity, requested_duration):
         print("Duration:", duration_text)
         print("=" * 70)
 
-        # Clean up memory
         gc.collect()
 
     except Exception as e:
@@ -426,7 +412,7 @@ def health():
         "original_tracks": len(ORIGINAL_TRACKS),
         "original_files": original_files,
         "library_tracks": len(load_library()),
-        "duration_support": "5-30 seconds (lightweight)"
+        "duration_support": "5-30 seconds"
     })
 
 
@@ -544,19 +530,18 @@ def generation_status(job_id):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
 
-    # Load model in background
     threading.Thread(target=load_musicgen_background, daemon=True).start()
 
     print()
     print("=" * 70)
-    print("SOUNDFORGE AI MUSIC GENERATOR (LIGHTWEIGHT)")
+    print("SOUNDFORGE AI MUSIC GENERATOR")
     print("=" * 70)
     print("Host: 0.0.0.0")
     print("Port:", port)
     print("AI Provider: Local MusicGen Tiny")
-    print("Model:", MODEL_NAME)
-    print("Memory: Optimized for 512MB (Render free tier)")
-    print("Duration: 5-30 seconds (lightweight)")
+    print("Model: facebook/musicgen-tiny")
+    print("Original tracks: 4")
+    print("Duration support: 5-30 seconds")
     print("=" * 70)
     print()
 
