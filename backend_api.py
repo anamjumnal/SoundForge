@@ -15,10 +15,6 @@ import torch
 from transformers import AutoProcessor, MusicgenForConditionalGeneration
 
 
-# ============================================================
-# SOUNDFORGE - LIGHTWEIGHT VERSION (Tiny Model)
-# ============================================================
-
 app = Flask(__name__)
 
 CORS(
@@ -35,10 +31,6 @@ GENERATED_DIR = BASE_DIR / "generated"
 GENERATED_DIR.mkdir(exist_ok=True)
 LIBRARY_FILE = BASE_DIR / "library.json"
 
-
-# ============================================================
-# ORIGINAL 4 TRACKS
-# ============================================================
 
 ORIGINAL_TRACKS = [
     {
@@ -76,20 +68,12 @@ ORIGINAL_TRACKS = [
 ]
 
 
-# ============================================================
-# JOB STATE
-# ============================================================
-
 generation_jobs = {}
 generation_jobs_lock = threading.Lock()
 model_lock = threading.Lock()
 
 
-# ============================================================
-# MUSICGEN TINY MODEL - LIGHTWEIGHT FOR FREE TIER
-# ============================================================
-
-MODEL_NAME = "facebook/musicgen-tiny"
+MODEL_NAME = "facebook/musicgen-small"
 processor = None
 model = None
 model_loading_status = {"loaded": False, "loading": False, "error": None}
@@ -103,10 +87,9 @@ def load_musicgen():
 
     print()
     print("=" * 70)
-    print("SOUNDFORGE - LOADING MUSICGEN TINY")
+    print("SOUNDFORGE - LOADING MUSICGEN")
     print("=" * 70)
-    print("Model: facebook/musicgen-tiny")
-    print("Loading lightweight model for free tier...")
+    print("Model: facebook/musicgen-small")
     print("=" * 70)
 
     try:
@@ -124,7 +107,7 @@ def load_musicgen():
         gc.collect()
 
         print("=" * 70)
-        print("MUSICGEN TINY LOADED SUCCESSFULLY")
+        print("MUSICGEN LOADED SUCCESSFULLY")
         print("=" * 70)
         print()
 
@@ -145,10 +128,6 @@ def load_musicgen_background():
     finally:
         model_loading_status["loading"] = False
 
-
-# ============================================================
-# LIBRARY
-# ============================================================
 
 def load_library():
     if not LIBRARY_FILE.exists():
@@ -173,10 +152,6 @@ def save_library(tracks):
         return False
 
 
-# ============================================================
-# FILE SEARCH
-# ============================================================
-
 def find_file_by_name(filename):
     filename = Path(filename).name
     direct = BASE_DIR / filename
@@ -191,10 +166,6 @@ def find_file_by_name(filename):
     return None
 
 
-# ============================================================
-# AUDIO HELPERS
-# ============================================================
-
 def normalize_audio(audio):
     audio = np.asarray(audio, dtype=np.float32)
     if audio.size == 0:
@@ -204,10 +175,6 @@ def normalize_audio(audio):
         audio = (audio / peak) * 0.95
     return audio.astype(np.float32)
 
-
-# ============================================================
-# GENERATE MUSIC
-# ============================================================
 
 def generate_music_simple(prompt, genre, duration_seconds, temperature):
     duration_seconds = max(5.0, min(float(duration_seconds), 30.0))
@@ -228,8 +195,6 @@ def generate_music_simple(prompt, genre, duration_seconds, temperature):
 
     max_new_tokens = int(duration_seconds * 25) + 30
 
-    print(f"Generating with {max_new_tokens} tokens...")
-
     with torch.no_grad():
         audio_values = model.generate(
             **inputs,
@@ -247,10 +212,6 @@ def generate_music_simple(prompt, genre, duration_seconds, temperature):
 
     return audio.astype(np.float32)
 
-
-# ============================================================
-# BACKGROUND GENERATION JOB
-# ============================================================
 
 def run_generation_job(job_id, prompt, genre, creativity, requested_duration):
     try:
@@ -317,7 +278,6 @@ def run_generation_job(job_id, prompt, genre, creativity, requested_duration):
         print("GENERATION SUCCESSFUL")
         print("=" * 70)
         print("Job ID:", job_id)
-        print("File:", output_path)
         print("Duration:", duration_text)
         print("=" * 70)
 
@@ -332,10 +292,6 @@ def run_generation_job(job_id, prompt, genre, creativity, requested_duration):
                 "track": None
             }
 
-
-# ============================================================
-# ROUTES
-# ============================================================
 
 @app.route("/")
 def home():
@@ -404,7 +360,7 @@ def health():
     return jsonify({
         "online": True,
         "project": "SoundForge",
-        "ai_provider": "Local MusicGen Tiny",
+        "ai_provider": "Local MusicGen",
         "model": MODEL_NAME,
         "model_loaded": model_loading_status["loaded"],
         "model_loading": model_loading_status["loading"],
@@ -523,10 +479,6 @@ def generation_status(job_id):
     })
 
 
-# ============================================================
-# START SERVER
-# ============================================================
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
 
@@ -538,10 +490,8 @@ if __name__ == "__main__":
     print("=" * 70)
     print("Host: 0.0.0.0")
     print("Port:", port)
-    print("AI Provider: Local MusicGen Tiny")
-    print("Model: facebook/musicgen-tiny")
-    print("Original tracks: 4")
-    print("Duration support: 5-30 seconds")
+    print("AI Provider: Local MusicGen")
+    print("Model: facebook/musicgen-small")
     print("=" * 70)
     print()
 
